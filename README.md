@@ -82,6 +82,33 @@ revocation invalidates all browser and MCP grants and closes active channels.
 MCP response headers may take up to 130 seconds, accommodating the existing
 120-second synchronous command timeout; ordinary Web responses retain 30 seconds.
 
+## Windows contexts in a managed browser
+
+A compatible Windows machine host can offer SYSTEM and policy-authorized
+interactive Windows sessions. This is not an application administrator/user role
+toggle, and standalone Web on Linux does not acquire Windows identities.
+The device page loads `/_anubis/context-ui.js` only when the host supports this
+contract. Its chooser displays the real Windows account, SID and session.
+
+`GET /_anubis/contexts` requires the authenticated device browser cookie and
+returns sanitized choices plus the current identity. `POST` to the same path
+requires same-origin JSON containing only a listed opaque `id`. The gateway
+requests the change through the SYSTEM transport, rotates its browser cookie
+without extending its lifetime, and closes only that browser session's existing
+HTTP/WebSocket channels. Other browsers remain in their own contexts. The
+browser clears its old `tokenElecterm` and reloads; the selected Windows profile
+still requires its own application password and retains its own DPAPI data.
+An expired logon or failed selection never selects a fallback account.
+
+The gateway strips browser-supplied `x-anubis-managed-session` and
+`x-anubis-managed-context` headers. It supplies a random server-only session
+binding and the host-issued selector on HTTP and WebSocket requests. The native
+adapter revalidates Windows policy/logon identity, and loopback ports, transport
+proofs and local tokens never reach the browser. The internal
+`/api/machine-contexts` route cannot be called directly through the public
+gateway. MCP-only grants cannot list or change contexts and remain SYSTEM scoped.
+Cookie rotation preserves the server-only binding; the old cookie is revoked.
+
 `createAgent` takes `baseUrl`, `identityFile`, `localPort`, optional fixed loopback
 `localHost`, `label`, `app`, `version`, async `probe`, `onStatus`, and optional
 `localHeaders`. The latter are injected into the first HTTP request of each local

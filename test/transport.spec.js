@@ -24,6 +24,9 @@ async function fixture (t, options = {}) {
     upstreamHeaders.push(req.headers)
     const chunks = []
     for await (const chunk of req) chunks.push(chunk)
+    if (req.url === '/api/machine-contexts' && options.contextHandler) {
+      return options.contextHandler(req, res, Buffer.concat(chunks))
+    }
     if (req.url === '/mcp?delay=1') await new Promise(resolve => setTimeout(resolve, 31000))
     if (req.url === '/mcp?stream=1') {
       res.writeHead(200, { 'content-type': 'text/event-stream' })
@@ -112,6 +115,148 @@ async function fixture (t, options = {}) {
   }
   return { dir, agent, gateway, server, base, states, api, browser, upstreamHeaders, localPort: upstream.address().port, setReady: value => { ready = value } }
 }
+
+async function browserSession (f) {
+  const ticket = await (await f.api(`/api/agents/${f.agent.id}/connect`, 'POST')).json()
+  const response = await f.browser('/_anubis/connect', {
+    method: 'POST', body: JSON.stringify({ ticket: ticket.ticket })
+  })
+  assert.equal(response.status, 200)
+  return { cookie: response.headers['set-cookie'][0].split(';')[0], origin: new URL(ticket.url).origin }
+}
+
+async function approve (f) {
+  f.agent.start()
+  await waitFor(() => f.agent.status === 'pending')
+  assert.equal((await f.api(`/api/agents/${f.agent.id}/approve`, 'POST')).status, 200)
+  await waitFor(async () => (await (await f.api('/api/agents')).json()).agents[0].online)
+}
+
+test('Windows contexts bind to one browser, rotate cookies, close only its sockets and never expose selectors or spoofable headers', { timeout: 15000 }, async t => {
+  const calls = []
+  const contexts = [
+    { id: '1'.repeat(32), target: 'system', identity: { sid: 'S-1-5-18', account: 'SYSTEM', sessionId: 0 } },
+    { id: '2'.repeat(32), target: 'user', identity: { sid: 'S-1-5-21-1-2-3-1001', account: 'MACHINE\\user', sessionId: 2 } }
+  ]
+  const selector = '3'.repeat(32)
+  const f = await fixture(t, {
+    contextHandler (req, res, payload) {
+      calls.push({ method: req.method, headers: req.headers, body: payload.toString() })
+      res.setHeader('content-type', 'application/json')
+      if (req.method === 'GET') return res.end(JSON.stringify({ supported: true, contexts }))
+      assert.equal(JSON.parse(payload).id, contexts[1].id)
+      res.end(JSON.stringify({
+        selector,
+        context: { contextId: '4'.repeat(32), identity: { ...contexts[1].identity, elevated: false, pid: 3210 } },
+        privateProof: 'never-expose-this',
+        localPort: 45123
+      }))
+    }
+  })
+  await approve(f)
+  const first = await browserSession(f)
+  const second = await browserSession(f)
+  assert.equal((await f.browser('/_anubis/contexts')).status, 401)
+  assert.equal((await f.browser('/api/machine-contexts', { cookie: first.cookie })).status, 403)
+  assert.equal((await f.browser('/api/%6dachine-contexts/', { cookie: first.cookie })).status, 403)
+  assert.equal((await f.browser('/_anubis/context-ui.js', { cookie: first.cookie })).status, 200)
+  const listed = await f.browser('/_anubis/contexts', { cookie: first.cookie })
+  assert.deepEqual(JSON.parse(listed.body).contexts, contexts)
+  const binding = calls[0].headers['x-anubis-managed-session']
+  assert.match(binding, /^[a-f0-9]{64}$/)
+  const sockets = [first, second].map(value => new WebSocket(f.base.replace('http:', 'ws:') + '/socket', {
+    headers: {
+      host: new URL(value.origin).host,
+      cookie: value.cookie,
+      'x-anubis-managed-session': 'spoof-session',
+      'x-anubis-managed-context': 'spoof-context'
+    }
+  }))
+  t.after(() => sockets.forEach(socket => socket.terminate()))
+  await Promise.all(sockets.map(socket => new Promise((resolve, reject) => {
+    socket.once('open', resolve)
+    socket.once('error', reject)
+  })))
+  const firstSocketHeaders = f.upstreamHeaders.at(-2)
+  const secondBinding = f.upstreamHeaders.at(-1)['x-anubis-managed-session']
+  assert.equal(firstSocketHeaders['x-anubis-managed-session'], binding)
+  assert.equal(firstSocketHeaders['x-anubis-managed-context'], undefined)
+  assert.notEqual(secondBinding, binding)
+  const invalid = await f.browser('/_anubis/contexts', {
+    cookie: first.cookie,
+    method: 'POST',
+    body: JSON.stringify({ id: contexts[1].id }),
+    headers: { origin: 'https://untrusted.invalid', 'content-type': 'application/json' }
+  })
+  assert.equal(invalid.status, 403)
+  assert.equal(calls.length, 1)
+  const changed = await f.browser('/_anubis/contexts', {
+    cookie: first.cookie,
+    method: 'POST',
+    body: JSON.stringify({ id: contexts[1].id }),
+    headers: { origin: first.origin, 'content-type': 'application/json' }
+  })
+  assert.equal(changed.status, 200)
+  assert.equal(calls[1].headers['x-anubis-managed-session'], binding)
+  for (const secret of [selector, 'never-expose-this', '45123', binding]) {
+    assert.equal(changed.body.toString().includes(secret), false)
+  }
+  const replacement = changed.headers['set-cookie'][0].split(';')[0]
+  assert.notEqual(replacement, first.cookie)
+  assert.equal((await f.browser('/', { cookie: first.cookie })).status, 401)
+  await waitFor(() => sockets[0].readyState === WebSocket.CLOSED)
+  assert.equal(sockets[1].readyState, WebSocket.OPEN)
+  await f.browser('/', {
+    cookie: replacement,
+    headers: { 'x-anubis-managed-context': 'spoof', 'x-anubis-managed-session': 'spoof' }
+  })
+  assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-context'], selector)
+  assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-session'], binding)
+  await f.browser('/', { cookie: second.cookie })
+  assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-context'], undefined)
+  assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-session'], secondBinding)
+  const selectedSocket = new WebSocket(f.base.replace('http:', 'ws:') + '/socket', {
+    headers: { host: new URL(first.origin).host, cookie: replacement }
+  })
+  t.after(() => selectedSocket.terminate())
+  await new Promise((resolve, reject) => { selectedSocket.once('open', resolve); selectedSocket.once('error', reject) })
+  assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-context'], selector)
+  const mcp = await (await f.api(`/api/agents/${f.agent.id}/mcp-token`, 'POST')).json()
+  assert.equal((await f.browser('/_anubis/contexts', { headers: { authorization: 'Bearer ' + mcp.token } })).status, 401)
+  await f.browser('/mcp', {
+    headers: { authorization: 'Bearer ' + mcp.token, 'x-anubis-managed-context': selector, 'x-anubis-managed-session': binding }
+  })
+  assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-context'], undefined)
+  assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-session'], undefined)
+})
+
+test('context failures never change the browser cookie or silently switch its existing target', { timeout: 15000 }, async t => {
+  let status = 409
+  const f = await fixture(t, {
+    contextHandler (_req, res) {
+      res.writeHead(status, { 'content-type': 'application/json' })
+      res.end(status === 200 ? '{"selector":"invalid"}' : '{"error":"stale Windows logon"}')
+    }
+  })
+  await approve(f)
+  const session = await browserSession(f)
+  for (const code of [409, 200, 503]) {
+    status = code
+    const response = await f.browser('/_anubis/contexts', {
+      cookie: session.cookie,
+      method: 'POST',
+      body: JSON.stringify({ id: '2'.repeat(32) }),
+      headers: { origin: session.origin, 'content-type': 'application/json' }
+    })
+    assert.equal(response.status, code === 200 ? 502 : code)
+    assert.equal(response.headers['set-cookie'], undefined)
+    assert.equal((await f.browser('/', { cookie: session.cookie })).status, 200)
+    assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-context'], undefined)
+  }
+  status = 404
+  const unavailable = await f.browser('/_anubis/contexts', { cookie: session.cookie })
+  assert.deepEqual(JSON.parse(unavailable.body), { supported: false, contexts: [] })
+})
 
 test('managed identity persists privately and corruption never replaces it', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'anubis-managed-id-'))
