@@ -1,0 +1,184 @@
+const { test } = require('node:test')
+const assert = require('node:assert/strict')
+const http = require('node:http')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const crypto = require('node:crypto')
+const { WebSocket, WebSocketServer } = require('ws')
+const { createAgent, identity } = require('..')
+const { createGateway } = require('../server')
+
+async function waitFor (predicate) {
+  const until = Date.now() + 10000
+  while (!await predicate()) {
+    if (Date.now() > until) throw new Error('Managed transport condition timed out')
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+}
+
+async function fixture (t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'anubis-managed-transport-'))
+  const upstreamHeaders = []
+  const upstream = http.createServer(async (req, res) => {
+    upstreamHeaders.push(req.headers)
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    res.writeHead(200, { 'content-type': 'application/octet-stream', 'x-upstream-path': req.url })
+    res.end(chunks.length ? Buffer.concat(chunks) : 'managed real HTTP response')
+  })
+  const echo = new WebSocketServer({ server: upstream })
+  echo.on('connection', (ws, req) => {
+    upstreamHeaders.push(req.headers)
+    ws.on('message', value => ws.send(value))
+    ws.on('error', () => {})
+  })
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve))
+  const gateway = createGateway({
+    dataDir: path.join(dir, 'server'),
+    domain: 'anubis.test',
+    isAdmin: req => req.headers.authorization === 'Bearer fixture-administrator',
+    channelTimeout: 2000
+  })
+  const server = http.createServer(async (req, res) => {
+    if (!await gateway.handle(req, res)) {
+      assert.equal(res.headersSent, false, 'Unhandled route already responded: ' + req.url)
+      res.writeHead(404)
+      res.end()
+    }
+  })
+  server.on('upgrade', gateway.upgrade)
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  const base = `http://127.0.0.1:${server.address().port}`
+  const states = []
+  let ready = true
+  const agent = createAgent({
+    baseUrl: base,
+    identityFile: path.join(dir, 'client.json'),
+    localPort: upstream.address().port,
+    localHeaders: { 'x-anubis-managed-auth': 'private-local-only' },
+    probe: async () => ready,
+    onStatus: value => states.push(value),
+    heartbeatMs: 50,
+    reconnectMs: 50
+  })
+  t.after(async () => {
+    await agent.stop()
+    await gateway.close()
+    for (const ws of echo.clients) ws.terminate()
+    await new Promise(resolve => echo.close(resolve))
+    server.closeAllConnections()
+    upstream.closeAllConnections()
+    await Promise.all([server, upstream].map(value => new Promise(resolve => value.close(resolve))))
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  async function api (route, method = 'GET', payload, admin = true) {
+    return fetch(base + route, {
+      method,
+      headers: admin ? { authorization: 'Bearer fixture-administrator' } : {},
+      body: payload ? JSON.stringify(payload) : undefined,
+      signal: AbortSignal.timeout(5000)
+    })
+  }
+  function browser (route, { cookie, method = 'GET', body, headers = {} } = {}) {
+    return new Promise((resolve, reject) => {
+      const request = http.request(base + route, {
+        method,
+        headers: {
+          host: `device-${agent.id.replace(/-/g, '')}.anubis.test`,
+          ...(cookie ? { cookie } : {}),
+          ...headers
+        }
+      }, response => {
+        const chunks = []
+        response.on('data', chunk => chunks.push(chunk))
+        response.on('end', () => resolve({
+          status: response.statusCode,
+          headers: response.headers,
+          body: Buffer.concat(chunks)
+        }))
+      })
+      request.once('error', reject)
+      request.setTimeout(10000, () => request.destroy(new Error('Gateway browser request timed out')))
+      request.end(body)
+    })
+  }
+  return { dir, agent, gateway, server, base, states, api, browser, upstreamHeaders, setReady: value => { ready = value } }
+}
+
+test('managed identity persists privately and corruption never replaces it', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'anubis-managed-id-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const file = path.join(dir, 'identity.json')
+  const first = identity(file)
+  assert.deepEqual(identity(file), first)
+  assert.match(first.secret, /^[a-f0-9]{64}$/)
+  fs.writeFileSync(file, '{invalid')
+  assert.throws(() => identity(file))
+  assert.equal(fs.readFileSync(file, 'utf8'), '{invalid')
+  assert.throws(() => createAgent({ baseUrl: 'http://untrusted.invalid/', identityFile: file, localPort: 1234 }), /HTTPS/)
+})
+
+test('real enrolled transport requires approval, streams HTTP and WebSocket, and revokes active access', { timeout: 30000 }, async t => {
+  const f = await fixture(t)
+  f.agent.start()
+  await waitFor(() => f.states.some(value => value.status === 'pending'))
+  assert.equal((await f.api('/api/agents', 'GET', undefined, false)).status, 401)
+  let listed = await (await f.api('/api/agents')).json()
+  assert.equal(listed.agents.length, 1)
+  assert.equal(listed.agents[0].online, false)
+  assert.equal(listed.agents[0].status, 'pending')
+  assert.equal(listed.agents[0].fingerprint, f.agent.fingerprint)
+  assert.equal(JSON.stringify(listed).includes(identity(path.join(f.dir, 'client.json')).secret), false)
+  assert.equal((await f.api(`/api/agents/${f.agent.id}/connect`, 'POST')).status, 503)
+  assert.equal((await f.api(`/api/agents/${f.agent.id}/approve`, 'POST', undefined, false)).status, 401)
+  assert.equal((await f.api(`/api/agents/${f.agent.id}/approve`, 'POST')).status, 200)
+  await waitFor(() => f.states.some(value => value.status === 'online'))
+  await waitFor(async () => (await (await f.api('/api/agents')).json()).agents[0].online)
+  assert.equal((await f.browser('/')).status, 401)
+  const issued = await (await f.api(`/api/agents/${f.agent.id}/connect`, 'POST')).json()
+  assert.equal(new URL(issued.url).hostname, `device-${f.agent.id.replace(/-/g, '')}.anubis.test`)
+  const exchanged = await f.browser('/_anubis/connect', { method: 'POST', body: JSON.stringify({ ticket: issued.ticket }) })
+  assert.equal(exchanged.status, 200)
+  const setCookie = exchanged.headers['set-cookie'][0]
+  assert.match(setCookie, /HttpOnly; Secure; SameSite=Strict/)
+  const cookie = setCookie.split(';')[0]
+  assert.equal((await f.browser('/_anubis/connect', { method: 'POST', body: JSON.stringify({ ticket: issued.ticket }) })).status, 401)
+  const response = await f.browser('/real/path?value=1', { cookie, headers: { 'x-anubis-managed-auth': 'spoofed' } })
+  assert.equal(response.status, 200)
+  assert.equal(response.body.toString(), 'managed real HTTP response')
+  assert.equal(response.headers['x-upstream-path'], '/real/path?value=1')
+  assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-auth'], 'private-local-only')
+  assert.equal((f.upstreamHeaders.at(-1).cookie || '').includes('__Host-anubis-gateway'), false)
+  const upload = crypto.randomBytes(512 * 1024)
+  const echoed = await f.browser('/upload', { cookie, method: 'POST', body: upload })
+  assert.equal(echoed.status, 200)
+  assert.deepEqual(echoed.body, upload)
+
+  const socket = new WebSocket(f.base.replace('http:', 'ws:') + '/socket', {
+    headers: { host: new URL(issued.url).hostname, cookie }
+  })
+  await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject) })
+  const message = new Promise((resolve, reject) => { socket.once('message', resolve); socket.once('error', reject) })
+  socket.send('real browser websocket bytes')
+  assert.equal((await message).toString(), 'real browser websocket bytes')
+  assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-auth'], 'private-local-only')
+  f.setReady(false)
+  await waitFor(async () => !(await (await f.api('/api/agents')).json()).agents[0].online)
+  assert.equal((await f.api(`/api/agents/${f.agent.id}/connect`, 'POST')).status, 503)
+  f.setReady(true)
+  await waitFor(async () => (await (await f.api('/api/agents')).json()).agents[0].online)
+  const closed = new Promise(resolve => socket.once('close', resolve))
+  assert.equal((await f.api(`/api/agents/${f.agent.id}/revoke`, 'POST')).status, 200)
+  await closed
+  assert.equal((await f.browser('/', { cookie })).status, 401)
+  await waitFor(() => f.states.some(value => value.status === 'revoked'))
+  listed = await (await f.api('/api/agents')).json()
+  assert.equal(listed.agents[0].status, 'revoked')
+  assert.equal(listed.agents[0].online, false)
+  const persisted = fs.readFileSync(path.join(f.dir, 'server', 'managed-agents.json'), 'utf8')
+  assert.ok(!persisted.includes(identity(path.join(f.dir, 'client.json')).secret))
+  assert.equal((await f.api('/api/agents/enroll', 'POST', {
+    id: f.agent.id, secret: crypto.randomBytes(32).toString('hex')
+  }, false)).status, 409)
+})
