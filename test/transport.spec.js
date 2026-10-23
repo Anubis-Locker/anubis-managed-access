@@ -110,7 +110,7 @@ async function fixture (t, options = {}) {
       request.end(body)
     })
   }
-  return { dir, agent, gateway, server, base, states, api, browser, upstreamHeaders, setReady: value => { ready = value } }
+  return { dir, agent, gateway, server, base, states, api, browser, upstreamHeaders, localPort: upstream.address().port, setReady: value => { ready = value } }
 }
 
 test('managed identity persists privately and corruption never replaces it', t => {
@@ -124,6 +124,124 @@ test('managed identity persists privately and corruption never replaces it', t =
   assert.throws(() => identity(file))
   assert.equal(fs.readFileSync(file, 'utf8'), '{invalid')
   assert.throws(() => createAgent({ baseUrl: 'http://untrusted.invalid/', identityFile: file, localPort: 1234 }), /HTTPS/)
+})
+
+test('fresh service profile enrolls independently without inheriting or changing legacy approval', { timeout: 15000 }, async t => {
+  const f = await fixture(t)
+  f.agent.start()
+  await waitFor(() => f.agent.status === 'pending')
+  assert.equal((await f.api(`/api/agents/${f.agent.id}/approve`, 'POST')).status, 200)
+  await waitFor(async () => (await (await f.api('/api/agents')).json()).agents[0].online)
+  const file = path.join(f.dir, 'server', 'managed-agents.json')
+  const legacyRecord = JSON.parse(fs.readFileSync(file, 'utf8'))[f.agent.id]
+  const legacyFile = path.join(f.dir, 'client.json')
+  const legacyBytes = fs.readFileSync(legacyFile)
+  const legacyIdentity = identity(legacyFile)
+  const ticket = await (await f.api(`/api/agents/${f.agent.id}/connect`, 'POST')).json()
+  const exchanged = await f.browser('/_anubis/connect', {
+    method: 'POST', body: JSON.stringify({ ticket: ticket.ticket })
+  })
+  const cookie = exchanged.headers['set-cookie'][0].split(';')[0]
+  const mcp = await (await f.api(`/api/agents/${f.agent.id}/mcp-token`, 'POST')).json()
+  const socket = new WebSocket(f.base.replace('http:', 'ws:') + '/socket', {
+    headers: { host: new URL(ticket.url).hostname, cookie }
+  })
+  t.after(() => socket.terminate())
+  await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject) })
+
+  const serviceFile = path.join(f.dir, 'system-private', 'identity.json')
+  const service = createAgent({
+    baseUrl: f.base,
+    identityFile: serviceFile,
+    localPort: f.localPort,
+    heartbeatMs: 50,
+    reconnectMs: 50
+  })
+  t.after(() => service.stop())
+  const serviceIdentity = identity(serviceFile)
+  assert.notEqual(service.id, f.agent.id)
+  assert.notEqual(serviceIdentity.secret, legacyIdentity.secret)
+  assert.notEqual(service.fingerprint, f.agent.fingerprint)
+  assert.equal(service.fingerprint, crypto.createHash('sha256').update(serviceIdentity.secret).digest('hex'))
+  assert.deepEqual(identity(serviceFile), serviceIdentity)
+  service.start()
+  await waitFor(() => service.status === 'pending')
+  let listed = (await (await f.api('/api/agents')).json()).agents
+  assert.equal(listed.length, 2)
+  const pending = listed.find(value => value.id === service.id)
+  assert.equal(pending.status, 'pending')
+  assert.equal(pending.fingerprint, service.fingerprint)
+  assert.equal(pending.platform, legacyRecord.platform)
+  assert.equal(pending.arch, legacyRecord.arch)
+  assert.equal(pending.online, false)
+  assert.equal(pending.url, undefined)
+  assert.equal((await f.api(`/api/agents/${service.id}/connect`, 'POST')).status, 503)
+  assert.equal((await f.api(`/api/agents/${service.id}/mcp-token`, 'POST')).status, 503)
+  for (const secret of [legacyIdentity.secret, serviceIdentity.secret]) {
+    const response = await fetch(f.base + `/api/agents/${service.id}/approve`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + secret },
+      signal: AbortSignal.timeout(5000)
+    })
+    assert.equal(response.status, 401)
+  }
+  const denied = new WebSocket(f.base.replace('http:', 'ws:') + `/api/agents/${service.id}/tunnel`, {
+    headers: { authorization: 'Bearer ' + serviceIdentity.secret }
+  })
+  const deniedStatus = await new Promise((resolve, reject) => {
+    denied.once('open', () => { denied.terminate(); reject(new Error('Pending service opened a tunnel')) })
+    denied.once('unexpected-response', (req, res) => {
+      const status = res.statusCode
+      res.resume()
+      denied.terminate()
+      resolve(status)
+    })
+    denied.on('error', () => {})
+  })
+  assert.equal(deniedStatus, 401)
+  for (const [id, secret] of [
+    [f.agent.id, serviceIdentity.secret],
+    [service.id, legacyIdentity.secret]
+  ]) {
+    assert.equal((await f.api('/api/agents/enroll', 'POST', { id, secret }, false)).status, 409)
+  }
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8'))[service.id].status, 'pending')
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8'))[f.agent.id], legacyRecord)
+
+  const approved = await f.api(`/api/agents/${service.id}/approve`, 'POST')
+  assert.equal(approved.status, 200)
+  assert.equal((await approved.json()).fingerprint, service.fingerprint)
+  await waitFor(async () => {
+    listed = (await (await f.api('/api/agents')).json()).agents
+    return listed.length === 2 && listed.every(value => value.status === 'approved' && value.online)
+  })
+  const enrollment = await f.api('/api/agents/enroll', 'POST', serviceIdentity, false)
+  assert.equal(enrollment.status, 200)
+  assert.equal((await enrollment.json()).status, 'approved')
+  const connection = await (await f.api(`/api/agents/${service.id}/connect`, 'POST')).json()
+  assert.notEqual(connection.url, ticket.url)
+  const serviceHost = { host: new URL(connection.url).hostname }
+  assert.equal((await f.browser('/', { cookie, headers: serviceHost })).status, 401)
+  assert.equal((await f.browser('/mcp', {
+    headers: { ...serviceHost, authorization: 'Bearer ' + mcp.token }
+  })).status, 401)
+  const serviceExchange = await f.browser('/_anubis/connect', {
+    method: 'POST', headers: serviceHost, body: JSON.stringify({ ticket: connection.ticket })
+  })
+  assert.equal(serviceExchange.status, 200)
+  const serviceCookie = serviceExchange.headers['set-cookie'][0].split(';')[0]
+  assert.equal((await f.browser('/', { cookie: serviceCookie, headers: serviceHost })).status, 200)
+  assert.equal((await f.browser('/', { cookie })).status, 200)
+  assert.equal((await f.browser('/mcp', { headers: { authorization: 'Bearer ' + mcp.token } })).status, 200)
+  const message = new Promise((resolve, reject) => { socket.once('message', resolve); socket.once('error', reject) })
+  socket.send('legacy channel survives independent service approval')
+  assert.equal((await message).toString(), 'legacy channel survives independent service approval')
+  assert.deepEqual(fs.readFileSync(legacyFile), legacyBytes)
+  const persisted = fs.readFileSync(file, 'utf8')
+  assert.deepEqual(JSON.parse(persisted)[f.agent.id], legacyRecord)
+  assert.equal(JSON.parse(persisted)[service.id].status, 'approved')
+  assert.equal(persisted.includes(serviceIdentity.secret), false)
+  assert.equal(persisted.includes(legacyIdentity.secret), false)
 })
 
 test('real enrolled transport requires approval, streams HTTP and WebSocket, and revokes active access', { timeout: 30000 }, async t => {
