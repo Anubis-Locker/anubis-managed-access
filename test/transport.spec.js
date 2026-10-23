@@ -17,13 +17,18 @@ async function waitFor (predicate) {
   }
 }
 
-async function fixture (t) {
+async function fixture (t, options = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'anubis-managed-transport-'))
   const upstreamHeaders = []
   const upstream = http.createServer(async (req, res) => {
     upstreamHeaders.push(req.headers)
     const chunks = []
     for await (const chunk of req) chunks.push(chunk)
+    if (req.url === '/mcp?stream=1') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.write('data: ready\n\n')
+      return
+    }
     res.writeHead(200, { 'content-type': 'application/octet-stream', 'x-upstream-path': req.url })
     res.end(chunks.length ? Buffer.concat(chunks) : 'managed real HTTP response')
   })
@@ -38,7 +43,8 @@ async function fixture (t) {
     dataDir: path.join(dir, 'server'),
     domain: 'anubis.test',
     isAdmin: req => req.headers.authorization === 'Bearer fixture-administrator',
-    channelTimeout: 2000
+    channelTimeout: 2000,
+    ...options
   })
   const server = http.createServer(async (req, res) => {
     if (!await gateway.handle(req, res)) {
@@ -131,7 +137,9 @@ test('real enrolled transport requires approval, streams HTTP and WebSocket, and
   assert.equal(listed.agents[0].fingerprint, f.agent.fingerprint)
   assert.equal(JSON.stringify(listed).includes(identity(path.join(f.dir, 'client.json')).secret), false)
   assert.equal((await f.api(`/api/agents/${f.agent.id}/connect`, 'POST')).status, 503)
+  assert.equal((await f.api(`/api/agents/${f.agent.id}/mcp-token`, 'POST')).status, 503)
   assert.equal((await f.api(`/api/agents/${f.agent.id}/approve`, 'POST', undefined, false)).status, 401)
+  assert.equal((await f.api(`/api/agents/${f.agent.id}/mcp-token`, 'POST', undefined, false)).status, 401)
   assert.equal((await f.api(`/api/agents/${f.agent.id}/approve`, 'POST')).status, 200)
   await waitFor(() => f.states.some(value => value.status === 'online'))
   await waitFor(async () => (await (await f.api('/api/agents')).json()).agents[0].online)
@@ -181,4 +189,61 @@ test('real enrolled transport requires approval, streams HTTP and WebSocket, and
   assert.equal((await f.api('/api/agents/enroll', 'POST', {
     id: f.agent.id, secret: crypto.randomBytes(32).toString('hex')
   }, false)).status, 409)
+})
+
+test('MCP grants are device/path/method scoped, stripped upstream, expire active SSE and revoke', { timeout: 15000 }, async t => {
+  const f = await fixture(t, { sessionMs: 2000 })
+  f.agent.start()
+  await waitFor(() => f.states.some(value => value.status === 'pending'))
+  await f.api(`/api/agents/${f.agent.id}/approve`, 'POST')
+  await waitFor(async () => (await (await f.api('/api/agents')).json()).agents[0].online)
+  const issued = await (await f.api(`/api/agents/${f.agent.id}/mcp-token`, 'POST')).json()
+  assert.match(issued.token, /^[a-f0-9]{64}$/)
+  assert.equal(issued.url, `https://device-${f.agent.id.replace(/-/g, '')}.anubis.test/mcp`)
+  assert.equal(issued.scope, 'mcp')
+  const headers = { authorization: 'Bearer ' + issued.token }
+  const response = await f.browser('/mcp?sessionId=fixture', {
+    method: 'POST', headers, body: '{"jsonrpc":"2.0","method":"initialize","id":1}'
+  })
+  assert.equal(response.status, 200)
+  assert.equal(response.body.toString(), '{"jsonrpc":"2.0","method":"initialize","id":1}')
+  assert.equal(f.upstreamHeaders.at(-1).authorization, undefined)
+  assert.equal(f.upstreamHeaders.at(-1)['x-anubis-managed-auth'], 'private-local-only')
+  assert.equal((await f.browser('/mcp', { method: 'DELETE', headers })).status, 200)
+  for (const route of ['/', '/api/get-constants', '/mcp/../api/get-constants', '/mcp/anything']) {
+    assert.equal((await f.browser(route, { headers })).status, 401, route)
+  }
+  assert.equal((await f.browser('/mcp', { method: 'PUT', headers })).status, 401)
+  assert.equal((await f.browser('/', { cookie: '__Host-anubis-gateway=' + issued.token })).status, 401)
+  assert.equal((await f.browser('/mcp', {
+    headers: { ...headers, host: `device-${crypto.randomUUID().replace(/-/g, '')}.anubis.test` }
+  })).status, 401)
+  assert.equal((await fetch(f.base + '/api/agents', { headers })).status, 401)
+  assert.equal((await f.browser('/mcp', {
+    headers: {
+      ...headers,
+      connection: 'Upgrade',
+      upgrade: 'websocket',
+      'sec-websocket-version': '13',
+      'sec-websocket-key': crypto.randomBytes(16).toString('base64')
+    }
+  })).status, 401)
+  const ended = new Promise((resolve, reject) => {
+    const request = http.get(f.base + '/mcp?stream=1', {
+      headers: { ...headers, host: new URL(issued.url).hostname }
+    }, response => {
+      assert.equal(response.statusCode, 200)
+      response.on('data', () => {})
+      response.once('aborted', resolve)
+      response.once('end', () => reject(new Error('SSE ended without session expiration')))
+    })
+    request.once('error', reject)
+  })
+  await ended
+  assert.ok(Date.now() >= issued.expiresAt)
+  assert.equal((await f.browser('/mcp', { headers })).status, 401)
+  const fresh = await (await f.api(`/api/agents/${f.agent.id}/mcp-token`, 'POST')).json()
+  assert.equal((await f.browser('/mcp', { headers: { authorization: 'Bearer ' + fresh.token } })).status, 200)
+  await f.api(`/api/agents/${f.agent.id}/revoke`, 'POST')
+  assert.equal((await f.browser('/mcp', { headers: { authorization: 'Bearer ' + fresh.token } })).status, 401)
 })

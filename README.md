@@ -22,6 +22,18 @@ must be configured. Tickets and administrator credentials are not placed in URLs
 The gateway strips its cookie and reserved headers before forwarding to the local
 application. Existing standalone Web user authentication remains in force.
 
+For external MCP clients, an administrator can POST
+`/api/agents/:id/mcp-token` for an approved, online device. The response contains
+`url`, `token`, `scope: "mcp"` and `expiresAt`. Supply the token as
+`Authorization: Bearer <token>` to the returned HTTPS `/mcp` endpoint. It expires
+after at most one hour and permits only GET, POST and DELETE on that device's exact
+`/mcp` path, including query parameters. It cannot open the browser UI, controller
+APIs or WebSockets. The gateway removes this credential before forwarding;
+the application's private transport-authenticated adapter handles local MCP
+authentication without uploading its local key. The local authenticated MCP
+widget must actually be running. Expiration closes active HTTP/SSE streams;
+revocation invalidates all browser and MCP grants and closes active channels.
+
 `createAgent` takes `baseUrl`, `identityFile`, `localPort`, optional fixed loopback
 `localHost`, `label`, `app`, `version`, async `probe`, `onStatus`, and optional
 `localHeaders`. The latter are injected into the first HTTP request of each local

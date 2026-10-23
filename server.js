@@ -105,18 +105,24 @@ function createGateway ({
     }
   }
 
-  function operator (req, id) {
+  function operator (req, id, upgrade = false) {
     const cookie = (req.headers.cookie || '').split(';').map(value => value.trim())
       .find(value => value.startsWith('__Host-anubis-gateway='))
     const key = cookie?.slice('__Host-anubis-gateway='.length)
-    const session = sessions.get(key)
+    const bearerKey = /^Bearer ([0-9a-f]{64})$/.exec(req.headers.authorization || '')?.[1]
+    const bearer = sessions.get(bearerKey)
+    const session = bearer?.scope === 'mcp' ? bearer : sessions.get(key)
     if (!session || session.id !== id || session.expiresAt <= Date.now() ||
         agents.get(id)?.status !== 'approved') return
+    if (session.scope === 'mcp' && (upgrade ||
+        new URL(req.url, 'http://localhost').pathname !== '/mcp' ||
+        !['GET', 'POST', 'DELETE'].includes(req.method))) return
     return session
   }
 
-  function headers (req, upgrade = false) {
+  function headers (req, upgrade = false, session) {
     const result = { ...req.headers }
+    if (session?.scope === 'mcp') delete result.authorization
     const reserved = ['proxy-authorization', 'proxy-authenticate', 'x-anubis-managed-auth',
       'forwarded', 'x-forwarded-host', 'x-forwarded-for', 'x-forwarded-proto']
     for (const name of reserved) delete result[name]
@@ -157,23 +163,32 @@ function createGateway ({
     })
   }
 
-  function request (req, stream, upgrade = false) {
+  function request (req, stream, upgrade = false, session) {
     return http.request({
       hostname: 'managed.local',
       port: 80,
       path: req.url,
       method: req.method,
-      headers: headers(req, upgrade),
+      headers: headers(req, upgrade, session),
       createConnection: () => stream
     })
   }
 
   async function proxy (req, res, id) {
-    if (!operator(req, id)) return json(res, 401, { error: 'Open this device from the administrator panel' })
+    const session = operator(req, id)
+    if (!session) return json(res, 401, { error: 'Open this device from the administrator panel' })
     let upstream
     try {
       const stream = await connect(id)
-      upstream = request(req, stream)
+      if (session.expiresAt <= Date.now()) {
+        stream.destroy()
+        return json(res, 401, { error: 'Managed access expired' })
+      }
+      upstream = request(req, stream, false, session)
+      const expiration = setTimeout(() => upstream.destroy(
+        Object.assign(new Error('Managed access expired'), { status: 401 })
+      ), session.expiresAt - Date.now())
+      expiration.unref?.()
       const timeout = setTimeout(() => upstream.destroy(new Error('Managed response timed out')), 30000)
       timeout.unref?.()
       upstream.once('response', remote => {
@@ -190,11 +205,14 @@ function createGateway ({
       })
       upstream.once('error', error => {
         clearTimeout(timeout)
-        if (!res.headersSent) json(res, 502, { error: 'Managed upstream connection failed' })
+        if (!res.headersSent) json(res, error.status || 502, { error: error.status === 401 ? error.message : 'Managed upstream connection failed' })
         else res.destroy(error)
       })
       req.once('aborted', () => upstream.destroy())
-      res.once('close', () => upstream.destroy())
+      res.once('close', () => {
+        clearTimeout(expiration)
+        upstream.destroy()
+      })
       req.pipe(upstream)
     } catch (error) {
       if (!res.headersSent) json(res, error.status || 502, { error: error.message })
@@ -214,7 +232,7 @@ function createGateway ({
           if (!ticket || ticket.id !== id || ticket.expiresAt <= Date.now() ||
               agents.get(id)?.status !== 'approved') return json(res, 401, { error: 'Invalid or expired connection ticket' })
           const key = crypto.randomBytes(32).toString('hex')
-          sessions.set(key, { id, expiresAt: Date.now() + sessionMs })
+          sessions.set(key, { id, scope: 'web', expiresAt: Date.now() + sessionMs })
           res.writeHead(200, {
             'content-type': 'application/json',
             'cache-control': 'no-store',
@@ -285,10 +303,17 @@ function createGateway ({
       if (url.pathname === '/api/agents' && req.method === 'GET') {
         return json(res, 200, { agents: [...agents].map(([id, value]) => publicAgent(id, value)) })
       }
-      const match = url.pathname.match(/^\/api\/agents\/([0-9a-f-]{36})\/(approve|revoke|connect)$/)
+      const match = url.pathname.match(/^\/api\/agents\/([0-9a-f-]{36})\/(approve|revoke|connect|mcp-token)$/)
       const agent = match && agents.get(match[1])
       if (!agent || req.method !== 'POST') return json(res, 404, { error: 'not found' })
       const [, agentId, action] = match
+      if (action === 'mcp-token') {
+        if (!publicAgent(agentId, agent).online) return json(res, 503, { error: 'Managed endpoint is not online' })
+        const token = crypto.randomBytes(32).toString('hex')
+        const expiresAt = Date.now() + Math.min(sessionMs, 60 * 60 * 1000)
+        sessions.set(token, { id: agentId, scope: 'mcp', expiresAt })
+        return json(res, 200, { url: origin(agentId) + '/mcp', token, scope: 'mcp', expiresAt })
+      }
       if (action === 'connect') {
         if (!publicAgent(agentId, agent).online) return json(res, 503, { error: 'Managed endpoint is not online' })
         const ticket = crypto.randomBytes(32).toString('hex')
@@ -318,7 +343,7 @@ function createGateway ({
     }
     const id = hostId(req)
     if (id) {
-      const session = operator(req, id)
+      const session = operator(req, id, true)
       if (!session) return reject(401)
       try {
         const stream = await connect(id)
