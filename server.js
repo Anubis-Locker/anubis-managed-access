@@ -189,7 +189,8 @@ function createGateway ({
         Object.assign(new Error('Managed access expired'), { status: 401 })
       ), session.expiresAt - Date.now())
       expiration.unref?.()
-      const timeout = setTimeout(() => upstream.destroy(new Error('Managed response timed out')), 30000)
+      const timeoutMs = new URL(req.url, 'http://localhost').pathname === '/mcp' ? 130000 : 30000
+      const timeout = setTimeout(() => upstream.destroy(new Error('Managed response timed out')), timeoutMs)
       timeout.unref?.()
       upstream.once('response', remote => {
         clearTimeout(timeout)

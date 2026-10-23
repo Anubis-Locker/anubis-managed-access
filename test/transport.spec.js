@@ -24,6 +24,7 @@ async function fixture (t, options = {}) {
     upstreamHeaders.push(req.headers)
     const chunks = []
     for await (const chunk of req) chunks.push(chunk)
+    if (req.url === '/mcp?delay=1') await new Promise(resolve => setTimeout(resolve, 31000))
     if (req.url === '/mcp?stream=1') {
       res.writeHead(200, { 'content-type': 'text/event-stream' })
       res.write('data: ready\n\n')
@@ -86,7 +87,7 @@ async function fixture (t, options = {}) {
       signal: AbortSignal.timeout(5000)
     })
   }
-  function browser (route, { cookie, method = 'GET', body, headers = {} } = {}) {
+  function browser (route, { cookie, method = 'GET', body, headers = {}, timeout = 10000 } = {}) {
     return new Promise((resolve, reject) => {
       const request = http.request(base + route, {
         method,
@@ -105,7 +106,7 @@ async function fixture (t, options = {}) {
         }))
       })
       request.once('error', reject)
-      request.setTimeout(10000, () => request.destroy(new Error('Gateway browser request timed out')))
+      request.setTimeout(timeout, () => request.destroy(new Error('Gateway browser request timed out')))
       request.end(body)
     })
   }
@@ -246,4 +247,31 @@ test('MCP grants are device/path/method scoped, stripped upstream, expire active
   assert.equal((await f.browser('/mcp', { headers: { authorization: 'Bearer ' + fresh.token } })).status, 200)
   await f.api(`/api/agents/${f.agent.id}/revoke`, 'POST')
   assert.equal((await f.browser('/mcp', { headers: { authorization: 'Bearer ' + fresh.token } })).status, 401)
+})
+
+test('MCP synchronous operations can respond beyond the ordinary 30-second Web header deadline', { timeout: 45000 }, async t => {
+  const f = await fixture(t)
+  f.agent.start()
+  await waitFor(() => f.states.some(value => value.status === 'pending'))
+  await f.api(`/api/agents/${f.agent.id}/approve`, 'POST')
+  await waitFor(async () => (await (await f.api('/api/agents')).json()).agents[0].online)
+  const issued = await (await f.api(`/api/agents/${f.agent.id}/mcp-token`, 'POST')).json()
+  const connection = await (await f.api(`/api/agents/${f.agent.id}/connect`, 'POST')).json()
+  const exchanged = await f.browser('/_anubis/connect', { method: 'POST', body: JSON.stringify({ ticket: connection.ticket }) })
+  const cookie = exchanged.headers['set-cookie'][0].split(';')[0]
+  const started = Date.now()
+  const responses = await Promise.all([
+    { headers: { authorization: 'Bearer ' + issued.token } },
+    { cookie }
+  ].map(credentials => f.browser('/mcp?delay=1', {
+    ...credentials,
+    method: 'POST',
+    body: 'long synchronous MCP response',
+    timeout: 40000
+  })))
+  for (const response of responses) {
+    assert.equal(response.status, 200)
+    assert.equal(response.body.toString(), 'long synchronous MCP response')
+  }
+  assert.ok(Date.now() - started >= 31000)
 })

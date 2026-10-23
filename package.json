@@ -1,6 +1,6 @@
 {
   "name": "@ai-security-tool/managed-access",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Authenticated Anubis managed instance enrollment and reverse Web transport",
   "main": "index.js",
   "license": "MIT",

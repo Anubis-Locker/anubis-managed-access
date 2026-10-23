@@ -33,6 +33,8 @@ the application's private transport-authenticated adapter handles local MCP
 authentication without uploading its local key. The local authenticated MCP
 widget must actually be running. Expiration closes active HTTP/SSE streams;
 revocation invalidates all browser and MCP grants and closes active channels.
+MCP response headers may take up to 130 seconds, accommodating the existing
+120-second synchronous command timeout; ordinary Web responses retain 30 seconds.
 
 `createAgent` takes `baseUrl`, `identityFile`, `localPort`, optional fixed loopback
 `localHost`, `label`, `app`, `version`, async `probe`, `onStatus`, and optional
