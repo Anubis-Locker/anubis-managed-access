@@ -5,7 +5,13 @@ The client initiates outbound TLS connections; no public listener or firewall
 opening is required on the managed PC. HTTP bodies and WebSocket streams travel
 over authenticated per-request binary channels, including file transfers.
 
-[Website](https://anubis.locker) · [Desktop](https://github.com/Anubis-Locker/anubis) · [Web](https://github.com/Anubis-Locker/anubis-web)
+[Website](https://anubis.locker) · [Desktop](https://github.com/Anubis-Locker/anubis) · [Web](https://github.com/Anubis-Locker/anubis-web) · [Product Wiki](https://github.com/Anubis-Locker/anubis/wiki)
+
+This README describes the source in this repository, not a guarantee that an
+installed desktop or Web release includes every capability described here.
+Confirm the installed version and host support before relying on a feature.
+The canonical product Wiki belongs to the desktop repository linked above;
+linking to it does not mean that its pages have been initialized or published.
 
 Enrollment, administrator approval, browser access and profile authentication are
 separate boundaries. This transport does not reset Windows or application
@@ -134,3 +140,9 @@ WebSocket echo, readiness, credential collision and revocation checks. Migration
 coverage uses synthetic user/service identities on the same loopback gateway,
 verifies independent approval and grants, and preserves the legacy profile,
 record and live transport. Tests do not alter a production controller.
+
+## License
+
+MIT License. Copyright (c) 2026 Anubis-Locker. See [LICENSE](LICENSE) for the
+complete terms; retain its copyright and permission notice in copies or
+substantial portions of the software.
