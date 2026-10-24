@@ -1,9 +1,15 @@
-# Anubis managed access
+# 🔗 Anubis managed access
 
 Shared managed-instance client and reverse Web gateway for Anubis-Security-Tool.
 The client initiates outbound TLS connections; no public listener or firewall
 opening is required on the managed PC. HTTP bodies and WebSocket streams travel
 over authenticated per-request binary channels, including file transfers.
+
+[Website](https://anubis.locker) · [Desktop](https://github.com/Anubis-Locker/anubis) · [Web](https://github.com/Anubis-Locker/anubis-web)
+
+Enrollment, administrator approval, browser access and profile authentication are
+separate boundaries. This transport does not reset Windows or application
+passwords and does not turn SYSTEM/session 0 into an interactive desktop.
 
 `createAgent` is exported from the package root; `createGateway` is exported from
 `@ai-security-tool/managed-access/server`. Node 20 or newer is required.
